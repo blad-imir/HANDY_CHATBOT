@@ -10,7 +10,7 @@ import numpy as np
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 pdf_path = os.path.join(BASE_DIR, "student_handbook.pdf")
-HPC_API_URL = "http://<HPC_SERVER_IP>:5000/ollama_chat"  # 🚨 Replace with your HPC IP
+HPC_API_URL = "http://180.193.216.136:5000/ollama_chat"
 OLLAMA_MODEL = "llama2"
 TOTAL_PAGES = 131  # For display purposes only
 
@@ -262,3 +262,4 @@ if st.button("Ask") and query:
         st.write("📚 **Sources**")
         for src in response["sources"]:
             st.caption(src)
+
