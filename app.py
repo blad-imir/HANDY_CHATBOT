@@ -2,13 +2,11 @@ import re
 import os
 import json
 import subprocess
-from flask import Flask, render_template, request, jsonify
 import pdfplumber
+import streamlit as st
 from sentence_transformers import SentenceTransformer
 import faiss
 import numpy as np
-
-app = Flask(__name__)
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 pdf_path = os.path.join(BASE_DIR, "student_handbook.pdf")
@@ -20,7 +18,7 @@ TOTAL_PAGES = 131  # For display purposes only
 # -------------------------
 def extract_pdf_pages(pdf_path):
     if not os.path.exists(pdf_path):
-        print("[WARN] PDF not found:", pdf_path)
+        st.warning(f"[WARN] PDF not found: {pdf_path}")
         return "", []
 
     pages = []
@@ -33,7 +31,6 @@ def extract_pdf_pages(pdf_path):
             if clean:
                 full_parts.append(f"[Page {i}]\n{clean}")
     full_text = "\n\n".join(full_parts)
-    print(f"[INFO] extracted {len(pages)} pages, text pages with content: {len(full_parts)}")
     return full_text, pages
 
 full_handbook_text, pages = extract_pdf_pages(pdf_path)
@@ -56,20 +53,15 @@ def chunk_text_by_page(pages, chunk_size=900, overlap=150):
     return chunks
 
 chunks = chunk_text_by_page(pages, chunk_size=800, overlap=100)
-print(f"[INFO] total chunks: {len(chunks)}")
 
 model = SentenceTransformer("all-mpnet-base-v2", device="cpu")
 index = None
 if chunks:
-    print("[INFO] computing embeddings...")
     embeddings = model.encode(chunks, convert_to_numpy=True, show_progress_bar=True)
     faiss.normalize_L2(embeddings)
     dim = embeddings.shape[1]
     index = faiss.IndexFlatIP(dim)
     index.add(embeddings)
-    print(f"[INFO] FAISS index ready with {index.ntotal} vectors")
-else:
-    print("[WARN] no chunks available, index not created")
 
 # -------------------------
 # --- Ollama helper -------
@@ -85,13 +77,12 @@ def ollama_chat(prompt, model_name=OLLAMA_MODEL, timeout=None):
         )
         return result.stdout.decode("utf-8").strip()
     except Exception as e:
-        err = json.dumps({
+        return json.dumps({
             "title": "Error",
             "answer": f"Ollama failed: {e}",
             "notes": "Check your model setup locally.",
             "sources": []
         })
-        return err
 
 # -------------------------
 # --- Utilities -----------
@@ -135,8 +126,7 @@ def fallback_keyword_page_search(query, pages, window_pages=2):
             chosen.add(pg)
 
     chosen_sorted = sorted(chosen)
-    ctx_parts = []
-    sources = []
+    ctx_parts, sources = [], []
     for pg in chosen_sorted:
         pg_text = pages[pg - 1] or ""
         ctx_parts.append(f"[Page {pg}]\n{pg_text}")
@@ -144,12 +134,10 @@ def fallback_keyword_page_search(query, pages, window_pages=2):
         title = firstline[:80] if firstline else f"Page {pg}"
         sources.append(f"Page {pg} of {len(pages)} – {title}")
 
-    context = "\n\n".join(ctx_parts)
-    return context, sources
+    return "\n\n".join(ctx_parts), sources
 
 def extract_pages_from_chunks(retrieved_chunks):
-    sources = []
-    seen = set()
+    sources, seen = [], set()
     for chunk in retrieved_chunks:
         m = re.search(r"\[Page\s+(\d+)\]", chunk)
         if m:
@@ -166,9 +154,6 @@ def extract_pages_from_chunks(retrieved_chunks):
                 sources.append(f"Page {p} of {len(pages)} – {title}")
     return sources
 
-# -------------------------
-# --- Special static QA ---
-# -------------------------
 def handle_special_queries(query):
     q = query.lower().strip()
     if q in ["who are you", "what are you", "introduce yourself"]:
@@ -184,29 +169,15 @@ def handle_special_queries(query):
         }
     return None
 
-# -------------------------
-# --- JSON safety helper --
-# -------------------------
 def safe_json_parse(text):
     try:
         return json.loads(text)
-    except json.JSONDecodeError:
-        # Try to "repair" common mistakes
-        text = text.strip()
-        if text.startswith("```"):
-            text = text.strip("`").strip()
-        if not text.startswith("{"):
-            text = "{" + text.split("{", 1)[-1]
-        if not text.endswith("}"):
-            text = text.rsplit("}", 1)[0] + "}"
-        try:
-            return json.loads(text)
-        except:
-            return {
-                "title": "Parse Error",
-                "answer": "The response could not be formatted into valid JSON.",
-                "notes": "Please rephrase your question."
-            }
+    except:
+        return {
+            "title": "Parse Error",
+            "answer": "The response could not be formatted into valid JSON.",
+            "notes": "Please rephrase your question."
+        }
 
 # -------------------------
 # --- Core: get_answer ----
@@ -217,55 +188,40 @@ def get_answer(query, k=6, min_faiss_score=0.15):
         return special
 
     norm_q = normalize_query_for_synonyms(query)
+    retrieved_chunks, sources = [], []
 
-    retrieved_chunks = []
-    sources = []
     if index is not None:
         q_vec = model.encode([norm_q], convert_to_numpy=True)
         faiss.normalize_L2(q_vec)
         D, I = index.search(q_vec, k)
         for score, idx in zip(D[0], I[0]):
-            if idx < 0 or idx >= len(chunks):
-                continue
-            if float(score) >= min_faiss_score:
+            if idx >= 0 and idx < len(chunks) and float(score) >= min_faiss_score:
                 retrieved_chunks.append(chunks[int(idx)])
         if retrieved_chunks:
             sources = extract_pages_from_chunks(retrieved_chunks)
 
-    context = ""
+    context = "\n\n".join(retrieved_chunks) if retrieved_chunks else ""
     if not retrieved_chunks:
         fallback_ctx, fallback_sources = fallback_keyword_page_search(norm_q, pages, window_pages=1)
         if fallback_ctx:
-            context = fallback_ctx
-            sources = fallback_sources
+            context, sources = fallback_ctx, fallback_sources
         else:
             return {
                 "title": "Information Not Found",
-                "answer": "I could not find information in the handbook regarding that question. Please consult the registrar or the academic office for confirmation.",
+                "answer": "I could not find information in the handbook.",
                 "sources": [],
-                "notes": "Handbook search returned no relevant passages."
+                "notes": "Consult registrar for confirmation."
             }
-    else:
-        context = "\n\n".join(retrieved_chunks)
 
-    # ✅ Strict JSON-only prompt
+    # strict JSON prompt
     prompt = f"""
 You are Handy, the Official Camarines Sur Polytechnic Colleges Student Handbook Chatbot. 
-You MUST respond in valid JSON only. 
-Do not include any text before or after the JSON. 
-Use this structure exactly:
+You MUST respond in valid JSON only, using this structure:
 
 {{
   "title": "short heading (max 8 words)",
   "answer": "concise but complete answer from the handbook",
-  "notes": "guidance or next steps, e.g., consult registrar"
-}}
-
-If no information is found in the context, return:
-{{
-  "title":"Information Not Found",
-  "answer":"I could not find information in the handbook.",
-  "notes":"Consult registrar for confirmation."
+  "notes": "guidance or next steps"
 }}
 
 Context:
@@ -275,60 +231,34 @@ Question: {query}
 """
 
     raw = ollama_chat(prompt, model_name=OLLAMA_MODEL)
-
-    parsed = {
-        "title": "Answer from CSPC Student Handbook",
-        "answer": "",
-        "notes": "",
-        "sources": sources
-    }
     try:
-        match = re.search(r"\{.*\}", raw, re.DOTALL)
-        if match:
-            json_str = match.group(0)
-            temp = safe_json_parse(json_str)
-            parsed["title"] = temp.get("title", parsed["title"])
-            parsed["answer"] = temp.get("answer", parsed["answer"] or raw)
-            parsed["notes"] = temp.get("notes", parsed["notes"])
-        else:
-            parsed["answer"] = raw.strip()
-            parsed["notes"] = "Response did not include valid JSON."
-    except Exception as e:
-        parsed["answer"] = raw.strip()
-        parsed["notes"] = f"Response could not be parsed into strict JSON: {e}"
+        parsed = safe_json_parse(raw)
+    except:
+        parsed = {
+            "title": "Parse Error",
+            "answer": raw,
+            "notes": "Response could not be parsed into JSON."
+        }
 
-    if not parsed["sources"]:
-        parsed["sources"] = sources
-
+    parsed["sources"] = parsed.get("sources", sources)
     return parsed
 
 # -------------------------
-# --- Flask endpoints -----
+# --- Streamlit UI --------
 # -------------------------
-@app.route("/")
-def home():
-    return render_template("index.html")
+st.set_page_config(page_title="Handy – CSPC Handbook Chatbot", page_icon="🤖", layout="centered")
+st.title("🤖 Handy – CSPC Student Handbook Chatbot")
+st.caption("Ask authoritative questions about the CSPC Student Handbook.")
 
-@app.route("/ask", methods=["POST"])
-def ask():
-    q = request.json.get("query", "")
-    if not q or not q.strip():
-        return jsonify({
-            "title": "No Query",
-            "answer": "Please enter a question.",
-            "sources": [],
-            "notes": "Provide a question about the CSPC Student Handbook."
-        })
-    try:
-        answer = get_answer(q.strip())
-        return jsonify(answer)
-    except Exception as e:
-        return jsonify({
-            "title": "Error",
-            "answer": f"An internal error occurred: {e}",
-            "sources": [],
-            "notes": "Check server logs for details."
-        })
-
-if __name__ == "__main__":
-    app.run(debug=True)
+query = st.text_input("Enter your question:", placeholder="e.g., What are the incentives for athletes?")
+if st.button("Ask") and query:
+    with st.spinner("Searching handbook..."):
+        response = get_answer(query)
+    st.subheader(response["title"])
+    st.write(response["answer"])
+    if response.get("notes"):
+        st.info(response["notes"])
+    if response.get("sources"):
+        st.write("📚 **Sources**")
+        for src in response["sources"]:
+            st.caption(src)
