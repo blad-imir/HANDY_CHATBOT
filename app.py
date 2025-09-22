@@ -8,18 +8,22 @@ from sentence_transformers import SentenceTransformer
 import faiss
 import numpy as np
 
+# -------------------------
+# --- Config --------------
+# -------------------------
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 pdf_path = os.path.join(BASE_DIR, "student_handbook.pdf")
+
 HPC_API_URL = "http://180.193.216.136:5000/ollama_chat"
 OLLAMA_MODEL = "llama2"
-TOTAL_PAGES = 131  # For display purposes only
+TOTAL_PAGES = 131
 
 # -------------------------
 # --- PDF extraction ------
 # -------------------------
+@st.cache_data(show_spinner=False)
 def extract_pdf_pages(pdf_path):
     if not os.path.exists(pdf_path):
-        st.warning(f"[WARN] PDF not found: {pdf_path}")
         return "", []
 
     pages = []
@@ -31,15 +35,15 @@ def extract_pdf_pages(pdf_path):
             pages.append(clean)
             if clean:
                 full_parts.append(f"[Page {i}]\n{clean}")
-    full_text = "\n\n".join(full_parts)
-    return full_text, pages
+    return "\n\n".join(full_parts), pages
 
 full_handbook_text, pages = extract_pdf_pages(pdf_path)
 
 # -------------------------
 # --- Chunking & vectors --
 # -------------------------
-def chunk_text_by_page(pages, chunk_size=900, overlap=150):
+@st.cache_resource(show_spinner=False)
+def build_index(pages, chunk_size=800, overlap=100):
     chunks = []
     for i, ptext in enumerate(pages, start=1):
         cleaned = re.sub(r"\s+", " ", ptext).strip()
@@ -51,21 +55,20 @@ def chunk_text_by_page(pages, chunk_size=900, overlap=150):
             start += chunk_size - overlap
         if not cleaned:
             chunks.append(f"[Page {i}] ")
-    return chunks
 
-chunks = chunk_text_by_page(pages, chunk_size=800, overlap=100)
-
-model = SentenceTransformer("all-mpnet-base-v2", device="cpu")
-index = None
-if chunks:
-    embeddings = model.encode(chunks, convert_to_numpy=True, show_progress_bar=True)
+    model = SentenceTransformer("all-mpnet-base-v2", device="cpu")
+    embeddings = model.encode(chunks, convert_to_numpy=True, show_progress_bar=False)
     faiss.normalize_L2(embeddings)
     dim = embeddings.shape[1]
     index = faiss.IndexFlatIP(dim)
     index.add(embeddings)
 
+    return model, index, chunks
+
+model, index, chunks = build_index(pages)
+
 # -------------------------
-# --- Ollama via HPC API --
+# --- HPC API -------------
 # -------------------------
 def ollama_chat(prompt, model_name=OLLAMA_MODEL, timeout=60):
     try:
@@ -79,63 +82,14 @@ def ollama_chat(prompt, model_name=OLLAMA_MODEL, timeout=60):
     except Exception as e:
         return json.dumps({
             "title": "Error",
-            "answer": f"Backend request failed: {e}",
-            "notes": "Check HPC server API connection.",
+            "answer": f"HPC backend request failed: {e}",
+            "notes": "Running in fallback mode (retrieved context only).",
             "sources": []
         })
 
 # -------------------------
-# --- Utilities -----------
+# --- Retrieval helpers ---
 # -------------------------
-def normalize_query_for_synonyms(query):
-    q = query.lower()
-    synonyms = {
-        "failing grades": ["failing marks", "failed subject", "5.0 grade", "failed grade", "fail grade", "failed coursework"],
-        "academic probation": ["probation", "on probation", "academic warning"],
-        "dismissal": ["expulsion", "removal", "dismissed"],
-        "attendance": ["absences", "attendance policy", "class attendance"]
-    }
-    for canonical, variants in synonyms.items():
-        for v in variants:
-            if v in q:
-                return canonical
-    return query
-
-def fallback_keyword_page_search(query, pages, window_pages=2):
-    q = query.lower()
-    tokens = re.findall(r"[a-z0-9]+", q)
-    if not tokens:
-        return "", []
-
-    page_scores = []
-    for i, p in enumerate(pages, start=1):
-        text_l = (p or "").lower()
-        score = sum(text_l.count(t) for t in tokens)
-        if score > 0:
-            page_scores.append((i, score))
-
-    if not page_scores:
-        return "", []
-
-    page_scores.sort(key=lambda x: x[1], reverse=True)
-    top_pages = [pnum for pnum, s in page_scores[:5]]
-
-    chosen = set()
-    for pnum in top_pages:
-        for pg in range(max(1, pnum - window_pages), min(len(pages), pnum + window_pages) + 1):
-            chosen.add(pg)
-
-    chosen_sorted = sorted(chosen)
-    ctx_parts, sources = [], []
-    for pg in chosen_sorted:
-        pg_text = pages[pg - 1] or ""
-        ctx_parts.append(f"[Page {pg}]\n{pg_text}")
-        firstline = pg_text.splitlines()[0].strip() if pg_text.splitlines() else ""
-        title = firstline[:80] if firstline else f"Page {pg}"
-        sources.append(f"Page {pg} of {len(pages)} – {title}")
-
-    return "\n\n".join(ctx_parts), sources
-
 def extract_pages_from_chunks(retrieved_chunks):
     sources, seen = [], set()
     for chunk in retrieved_chunks:
@@ -145,81 +99,69 @@ def extract_pages_from_chunks(retrieved_chunks):
             if p not in seen:
                 seen.add(p)
                 clean_text = re.sub(r"\[Page \d+\]", "", chunk).strip()
-                heading_match = re.search(r"(CHAPTER [^\n]+|[A-Z][A-Z\s,;&\-]{5,})", clean_text)
-                if heading_match:
-                    title = heading_match.group(1).strip()
-                else:
-                    sentences = re.split(r'(?<=[.!?])\s+', clean_text)
-                    title = sentences[0][:80] if sentences else ""
+                title = clean_text[:80] if clean_text else f"Page {p}"
                 sources.append(f"Page {p} of {len(pages)} – {title}")
     return sources
 
-def handle_special_queries(query):
-    q = query.lower().strip()
-    if q in ["who are you", "what are you", "introduce yourself"]:
-        return {
-            "title": "Official CSPC Student Handbook Chatbot",
-            "answer": (
-                "I am Handy — the Official CSPC Student Handbook Chatbot. "
-                "I provide authoritative answers strictly from the CSPC Student Handbook. "
-                "If I cannot find an answer in the handbook, I will tell you to consult the registrar."
-            ),
-            "sources": [],
-            "notes": "I answer only using the official handbook content."
-        }
-    return None
+def fallback_keyword_search(query, pages, window_pages=1):
+    q = query.lower()
+    tokens = re.findall(r"[a-z0-9]+", q)
+    if not tokens:
+        return "", []
 
-def safe_json_parse(text):
-    try:
-        return json.loads(text)
-    except:
-        return {
-            "title": "Parse Error",
-            "answer": "The response could not be formatted into valid JSON.",
-            "notes": "Please rephrase your question."
-        }
+    page_scores = []
+    for i, p in enumerate(pages, start=1):
+        score = sum((p or "").lower().count(t) for t in tokens)
+        if score > 0:
+            page_scores.append((i, score))
+
+    if not page_scores:
+        return "", []
+
+    top_page = sorted(page_scores, key=lambda x: x[1], reverse=True)[0][0]
+    chosen = range(max(1, top_page - window_pages), min(len(pages), top_page + window_pages) + 1)
+
+    ctx_parts, sources = [], []
+    for pg in chosen:
+        pg_text = pages[pg - 1] or ""
+        ctx_parts.append(f"[Page {pg}]\n{pg_text}")
+        sources.append(f"Page {pg} of {len(pages)}")
+    return "\n\n".join(ctx_parts), sources
 
 # -------------------------
-# --- Core: get_answer ----
+# --- Core QA -------------
 # -------------------------
-def get_answer(query, k=6, min_faiss_score=0.15):
-    special = handle_special_queries(query)
-    if special:
-        return special
+def get_answer(query, use_hpc=True, k=6, min_faiss_score=0.15):
+    # vector search
+    q_vec = model.encode([query], convert_to_numpy=True)
+    faiss.normalize_L2(q_vec)
+    D, I = index.search(q_vec, k)
 
-    norm_q = normalize_query_for_synonyms(query)
-    retrieved_chunks, sources = [], []
+    retrieved_chunks = [
+        chunks[idx] for score, idx in zip(D[0], I[0])
+        if idx >= 0 and idx < len(chunks) and float(score) >= min_faiss_score
+    ]
 
-    if index is not None:
-        q_vec = model.encode([norm_q], convert_to_numpy=True)
-        faiss.normalize_L2(q_vec)
-        D, I = index.search(q_vec, k)
-        for score, idx in zip(D[0], I[0]):
-            if idx >= 0 and idx < len(chunks) and float(score) >= min_faiss_score:
-                retrieved_chunks.append(chunks[int(idx)])
-        if retrieved_chunks:
-            sources = extract_pages_from_chunks(retrieved_chunks)
+    sources = extract_pages_from_chunks(retrieved_chunks)
+    context = "\n\n".join(retrieved_chunks)
 
-    context = "\n\n".join(retrieved_chunks) if retrieved_chunks else ""
-    if not retrieved_chunks:
-        fallback_ctx, fallback_sources = fallback_keyword_page_search(norm_q, pages, window_pages=1)
-        if fallback_ctx:
-            context, sources = fallback_ctx, fallback_sources
-        else:
-            return {
-                "title": "Information Not Found",
-                "answer": "I could not find information in the handbook.",
-                "sources": [],
-                "notes": "Consult registrar for confirmation."
-            }
+    if not context:
+        context, sources = fallback_keyword_search(query, pages)
 
-    # strict JSON prompt
+    if not use_hpc:  # fallback mode
+        return {
+            "title": "Retrieved Context",
+            "answer": context[:800] + ("..." if len(context) > 800 else ""),
+            "notes": "No HPC backend used. This is raw context only.",
+            "sources": sources
+        }
+
     prompt = f"""
-You are Handy, the Official Camarines Sur Polytechnic Colleges Student Handbook Chatbot. 
-You MUST respond in valid JSON only, using this structure:
+You are Handy, the CSPC Student Handbook Chatbot.
+Respond strictly in JSON format:
 
 {{
-  "title": "short heading (max 8 words)",
+  "title": "short heading",
   "answer": "concise but complete answer from the handbook",
   "notes": "guidance or next steps"
 }}
@@ -229,16 +171,11 @@ Context:
 
 Question: {query}
 """
-
     raw = ollama_chat(prompt, model_name=OLLAMA_MODEL)
     try:
-        parsed = safe_json_parse(raw)
+        parsed = json.loads(raw)
     except:
-        parsed = {
-            "title": "Parse Error",
-            "answer": raw,
-            "notes": "Response could not be parsed into JSON."
-        }
+        parsed = {"title": "Parse Error", "answer": raw, "notes": "Could not parse JSON."}
 
     parsed["sources"] = parsed.get("sources", sources)
     return parsed
@@ -251,9 +188,12 @@ st.title("🤖 Handy – CSPC Student Handbook Chatbot")
 st.caption("Ask authoritative questions about the CSPC Student Handbook.")
 
 query = st.text_input("Enter your question:", placeholder="e.g., What are the incentives for athletes?")
+use_hpc = st.toggle("Use HPC backend", value=True)
+
 if st.button("Ask") and query:
     with st.spinner("Searching handbook..."):
-        response = get_answer(query)
+        response = get_answer(query, use_hpc=use_hpc)
+
     st.subheader(response["title"])
     st.write(response["answer"])
     if response.get("notes"):
@@ -262,4 +202,3 @@ if st.button("Ask") and query:
         st.write("📚 **Sources**")
         for src in response["sources"]:
             st.caption(src)
-
