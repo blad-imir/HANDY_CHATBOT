@@ -1,7 +1,7 @@
 import re
 import os
 import json
-import subprocess
+import requests
 import pdfplumber
 import streamlit as st
 from sentence_transformers import SentenceTransformer
@@ -10,6 +10,7 @@ import numpy as np
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 pdf_path = os.path.join(BASE_DIR, "student_handbook.pdf")
+HPC_API_URL = "http://<HPC_SERVER_IP>:5000/ollama_chat"  # 🚨 Replace with your HPC IP
 OLLAMA_MODEL = "llama2"
 TOTAL_PAGES = 131  # For display purposes only
 
@@ -64,23 +65,22 @@ if chunks:
     index.add(embeddings)
 
 # -------------------------
-# --- Ollama helper -------
+# --- Ollama via HPC API --
 # -------------------------
-def ollama_chat(prompt, model_name=OLLAMA_MODEL, timeout=None):
+def ollama_chat(prompt, model_name=OLLAMA_MODEL, timeout=60):
     try:
-        result = subprocess.run(
-            ["ollama", "run", model_name],
-            input=prompt.encode("utf-8"),
-            capture_output=True,
-            check=True,
+        response = requests.post(
+            HPC_API_URL,
+            json={"prompt": prompt, "model": model_name},
             timeout=timeout
         )
-        return result.stdout.decode("utf-8").strip()
+        response.raise_for_status()
+        return response.json().get("output", "")
     except Exception as e:
         return json.dumps({
             "title": "Error",
-            "answer": f"Ollama failed: {e}",
-            "notes": "Check your model setup locally.",
+            "answer": f"Backend request failed: {e}",
+            "notes": "Check HPC server API connection.",
             "sources": []
         })
 
